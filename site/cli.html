@@ -118,23 +118,23 @@
           <thead><tr><th>Field</th><th>Type</th><th>Present when</th><th>Description</th></tr></thead>
           <tbody>
             <tr><td><code>ok</code></td><td>bool</td><td>always</td><td><code>true</code> on success, <code>false</code> on error</td></tr>
-            <tr><td><code>verb</code></td><td>string</td><td>always</td><td>The CLI verb that produced this envelope (e.g. <code>"new"</code>, <code>"record start"</code>)</td></tr>
+            <tr><td><code>verb</code></td><td>string</td><td>always</td><td>The verb group that produced this envelope (e.g. <code>"new"</code>, <code>"info"</code>). Subcommand groups collapse to the group name: every <code>record</code> subcommand emits <code>"record"</code> and every <code>viewer</code> subcommand emits <code>"viewer"</code>.</td></tr>
             <tr><td><code>data</code></td><td>object</td><td><code>ok: true</code></td><td>Verb-specific payload (see each verb below)</td></tr>
-            <tr><td><code>error</code></td><td>object</td><td><code>ok: false</code></td><td>Structured error: <code>{ "code": "E_NOT_FOUND", "message": "..." }</code></td></tr>
+            <tr><td><code>error</code></td><td>object</td><td><code>ok: false</code></td><td>Structured error: <code>{ "code": "E_NOT_FOUND", "message": "...", "detail": null }</code>. <code>detail</code> is reserved and currently always <code>null</code>.</td></tr>
           </tbody>
         </table>
         <pre><code><span class="c"># Success</span>
-{ "ok": true,  "verb": "new",        "data": { "name": "demo", "size": "1920x1080" } }
+{ "ok": true,  "verb": "new",        "data": { "name": "demo", "width": 1920, "height": 1080 } }
 
 <span class="c"># Error</span>
-{ "ok": false, "verb": "info",       "error": { "code": "E_NOT_FOUND", "message": "session 'x' not found" } }
+{ "ok": false, "verb": "info",       "error": { "code": "E_NOT_FOUND", "message": "no such session: x", "detail": null } }
 
 <span class="c"># Screenshot: data.png_b64 is a standard base64-encoded PNG string</span>
-{ "ok": true,  "verb": "screenshot", "data": { "window_id": 3, "png_b64": "iVBOR..." } }
+{ "ok": true,  "verb": "screenshot", "data": { "width": 1280, "height": 720, "png_b64": "iVBOR..." } }
 
 <span class="c"># Streaming verbs (events, logs) emit NDJSON: one envelope per line</span>
-{ "ok": true, "verb": "events", "data": { "topic": "windows", "kind": "created", ... } }
-{ "ok": true, "verb": "events", "data": { "topic": "windows", "kind": "destroyed", ... } }</code></pre>
+{ "id": 0, "event": "window_created", "params": { "name": "demo", "window_id": 3, "app_id": "foot", "title": "foot", "pid": 12345 } }
+{ "id": 0, "event": "window_destroyed", "params": { "name": "demo", "window_id": 3 } }</code></pre>
 
         <div class="note">
           <p>The exit code mirrors <code>ok</code>: exit 0 on success, non-zero on error. Both
@@ -181,25 +181,27 @@
           </tbody>
         </table>
         <pre><code><span class="c"># --json output</span>
-{ "ok": true, "verb": "new", "data": { "name": "demo", "size": "1920x1080", "scale": 1 } }</code></pre>
+{ "ok": true, "verb": "new", "data": { "name": "demo", "width": 1920, "height": 1080 } }</code></pre>
 
         <h3 id="ls">ls</h3>
         <p>List all sessions.</p>
         <pre><code><span class="k">waymux</span> ls [--json]</code></pre>
         <pre><code><span class="c"># --json output</span>
-{ "ok": true, "verb": "ls", "data": { "sessions": [ { "name": "demo", "size": "1920x1080" } ] } }</code></pre>
+{ "ok": true, "verb": "ls", "data": { "sessions": [
+    { "name": "demo", "pid": 12345, "width": 1920, "height": 1080, "scale": 1, "attached": false, "created_at": 1767225600 }
+] } }</code></pre>
 
         <h3 id="info">info</h3>
         <p>Show details for a single session.</p>
         <pre><code><span class="k">waymux</span> info &lt;NAME&gt; [--json]</code></pre>
         <pre><code><span class="c"># --json output</span>
-{ "ok": true, "verb": "info", "data": { "name": "demo", "size": "1920x1080", "scale": 1, ... } }</code></pre>
+{ "ok": true, "verb": "info", "data": { "name": "demo", "width": 1920, "height": 1080, "attached": false, "created_at": 1767225600, "pid": 12345 } }</code></pre>
 
         <h3 id="rm">rm</h3>
         <p>Destroy a session and all resources associated with it.</p>
         <pre><code><span class="k">waymux</span> rm &lt;NAME&gt; [--json]</code></pre>
         <pre><code><span class="c"># --json output</span>
-{ "ok": true, "verb": "rm", "data": { "name": "demo" } }</code></pre>
+{ "ok": true, "verb": "rm", "data": { "name": "demo", "destroyed": true } }</code></pre>
 
         <h3 id="resize">resize</h3>
         <p>
@@ -210,7 +212,7 @@
         <pre><code><span class="k">waymux</span> resize &lt;NAME&gt; &lt;WxH&gt; [--json]
 <span class="k">waymux</span> resize demo 1280x720</code></pre>
         <pre><code><span class="c"># --json output</span>
-{ "ok": true, "verb": "resize", "data": { "name": "demo", "size": "1280x720" } }</code></pre>
+{ "ok": true, "verb": "resize", "data": { "name": "demo", "width": 1280, "height": 720 } }</code></pre>
 
         <hr>
 
@@ -233,7 +235,8 @@
         </table>
         <pre><code><span class="c"># --json output</span>
 { "ok": true, "verb": "windows", "data": { "windows": [
-    { "id": 3, "app_id": "foot", "title": "foot", "tags": ["term"], "pid": 12345 }
+    { "id": 3, "app_id": "foot", "title": "foot", "tags": ["term"], "focused": true, "pid": 12345,
+      "geometry": { "x": 0, "y": 0, "width": 1920, "height": 1080 }, "content_rect": null }
 ] } }</code></pre>
 
         <h3 id="tag">tag</h3>
@@ -244,7 +247,7 @@
         <pre><code><span class="k">waymux</span> tag &lt;NAME&gt; &lt;WINDOW_ID&gt; &lt;TAG&gt;... [--json]
 <span class="k">waymux</span> tag demo 3 browser main</code></pre>
         <pre><code><span class="c"># --json output</span>
-{ "ok": true, "verb": "tag", "data": { "window_id": 3, "tags": ["browser","main"] } }</code></pre>
+{ "ok": true, "verb": "tag", "data": { "name": "demo", "window_id": 3, "tags": ["browser","main"] } }</code></pre>
 
         <h3 id="wait">wait</h3>
         <p>
