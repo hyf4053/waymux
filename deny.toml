@@ -1,4 +1,4 @@
-# deny.toml — supply-chain gating for waymux
+# deny.toml: supply-chain gating for waymux
 #
 # Run locally: cargo deny check
 # CI runs the same command on every push/PR.
@@ -37,7 +37,7 @@ allow = [
 # Removed allowances we don't currently need: Unicode-DFS-2016, MPL-2.0,
 # CC0-1.0. cargo-deny 0.18+ fails the licenses check on unmatched
 # allowances ("license-not-encountered" warnings escalate to errors).
-# Add back deliberately if a future dep brings one in — that's the
+# Add back deliberately if a future dep brings one in; that is the
 # point: every allowed license should be a conscious decision.
 confidence-threshold = 0.9
 exceptions = [

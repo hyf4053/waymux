@@ -42,12 +42,19 @@ impl Daemon {
         // Always rebuild: Cargo does NOT track the sibling binary as a test
         // dependency, so a stale `waymux-session` persists across code
         // changes. The build is a no-op when nothing's changed.
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let status = std::process::Command::new(cargo)
-            .args(["build", "-p", "waymux-session"])
-            .status()
-            .expect("spawn cargo build -p waymux-session");
-        assert!(status.success(), "cargo build -p waymux-session failed");
+        //
+        // But build exactly once per test binary: concurrent nested
+        // `cargo build`s from parallel tests contend on cargo's global
+        // file locks and have deadlocked CI (2026-07-04).
+        static BUILD_SESSION_BIN: std::sync::Once = std::sync::Once::new();
+        BUILD_SESSION_BIN.call_once(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let status = std::process::Command::new(cargo)
+                .args(["build", "-p", "waymux-session"])
+                .status()
+                .expect("spawn cargo build -p waymux-session");
+            assert!(status.success(), "cargo build -p waymux-session failed");
+        });
         assert!(
             session_bin.exists(),
             "waymux-session not found at {} after build",

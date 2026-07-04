@@ -56,12 +56,22 @@ impl Daemon {
             .parent()
             .unwrap()
             .join("waymux-session");
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        assert!(std::process::Command::new(cargo)
-            .args(["build", "-p", "waymux-session"])
-            .status()
-            .expect("cargo build")
-            .success());
+        // Build the sibling session binary exactly once per test binary.
+        // Parallel tests each running their own `cargo build` contend on
+        // cargo's global package-cache and build-directory file locks and
+        // have deadlocked a slow CI runner (2026-07-04: one test blocked on
+        // the lock for 57 minutes until the job timeout). cargo executes
+        // test binaries sequentially, so Once here also means at most one
+        // nested cargo process globally.
+        static BUILD_SESSION_BIN: std::sync::Once = std::sync::Once::new();
+        BUILD_SESSION_BIN.call_once(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            assert!(std::process::Command::new(cargo)
+                .args(["build", "-p", "waymux-session"])
+                .status()
+                .expect("cargo build")
+                .success());
+        });
 
         let child = Command::new(daemon_bin)
             .arg("--socket")
