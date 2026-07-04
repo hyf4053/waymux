@@ -2069,7 +2069,11 @@ fn recording_thread(
     // Cache the latest wire frame for the min-fps duplication path only, so the
     // default commit-driven mode pays no extra clone.
     let keep_last = min_fps.filter(|n| *n > 0).is_some();
-    let mut last_pixels: Vec<u8> = if keep_last { first_wire.clone() } else { Vec::new() };
+    let mut last_pixels: Vec<u8> = if keep_last {
+        first_wire.clone()
+    } else {
+        Vec::new()
+    };
     if tx.send(first_wire).is_err() {
         warn!("recording: writer thread exited before the first frame");
         let _ = writer.join();

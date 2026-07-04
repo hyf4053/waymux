@@ -1563,10 +1563,45 @@ impl State {
                         // Wrong-size commits (the cursor, popups) are dropped by
                         // the recorder's frame-size check; the recorder sizes to
                         // the desktop output because prime_recording_first_frame
-                        // seeds it from the output-sized surface first. The GPU
-                        // encoders' dmabuf import barrier (QUEUE_FAMILY_FOREIGN_EXT)
-                        // syncs with the producer, so we don't gate on
-                        // gpu_writes_done.
+                        // seeds it from the output-sized surface first.
+                        //
+                        // The in-process VA-API encoder is FIXED to the desktop
+                        // output size and has NO producer-sync barrier (unlike the
+                        // Vulkan/NVENC encoders, which insert a QUEUE_FAMILY_FOREIGN_EXT
+                        // barrier on import and so tee unconditionally below). So for
+                        // VA-API we tee ONLY the desktop-output surface, and only when
+                        // the producer's writes are complete. This prevents the two
+                        // failures both seen with KWin (which uses explicit sync AND
+                        // commits a separate 24x24 hardware-cursor surface that a
+                        // single-surface client like a bare Vulkan app never does):
+                        //
+                        //  1. Wrong-surface clobber: the WholeDesktop tap fires on
+                        //     EVERY commit, including the cursor / popups / subsurfaces
+                        //     (committed_is_dmabuf == false: not a desktop-output-sized
+                        //     dmabuf). Teeing those into the latest-only frame slot
+                        //     overwrites the real desktop frame with a 24x24 buffer the
+                        //     encoder then size-rejects and holds -> real frames rarely
+                        //     survive -> black viewer. (This is the actual mechanism
+                        //     behind the old "zero-copy gives black frames on KWin".)
+                        //  2. Producer not done: an explicit-sync producer (KWin via
+                        //     wp_linux_drm_syncobj) whose acquire fence has not signaled
+                        //     (gpu_writes_done == false) would be teed half-rendered ->
+                        //     torn/black. The acquire fence is waited at commit time;
+                        //     gpu_writes_done is true when it signaled OR the implicit
+                        //     dmabuf fence is ready.
+                        //
+                        // The InnerBufferHold (created in push_focused) pins the buffer
+                        // against recycle until the encoder finishes, and the viewer
+                        // encoder additionally gates on the implicit dmabuf fence for
+                        // implicit-sync clients. Together this makes the VA-API
+                        // zero-copy path correct for explicit- and implicit-sync,
+                        // linear and tiled, single- and multi-surface producers.
+                        // Skipped frames are held by the viewer's min-fps tick.
+                        let vaapi_gate =
+                            matches!(codec, waymux_protocol::RecordingCodec::H264Vaapi);
+                        if vaapi_gate && (!committed_is_dmabuf || !gpu_writes_done) {
+                            continue;
+                        }
                         self.push_focused_buffer_to_recording(surface, slot, *codec);
                     } else {
                         // Real CPU codecs (recording sinks) still get the

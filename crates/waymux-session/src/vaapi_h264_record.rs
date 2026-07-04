@@ -69,6 +69,16 @@ pub struct VaapiH264Encoder {
     /// until the first dmabuf frame; `Some(None)` once import proved
     /// unsupported on this host (→ permanent readback fallback).
     importer: Option<Option<DmabufFilter>>,
+    /// Last zero-copy VA-API NV12 frame (an `av_frame_clone`, which refs the
+    /// same GPU surface — cheap) so an idle/sparse tick can re-emit it via
+    /// `reencode_last`. The zero-copy path (`encode_dmabuf`) never produces CPU
+    /// NV12, so `last_nv12` stays empty while it runs; without this cache
+    /// `reencode_last` falls back to a stale/black bootstrap frame and an idle
+    /// nested desktop (KWin committing nothing) streams black / flickers under
+    /// sparse damage. Null until the first zero-copy frame; freed + replaced on
+    /// each zero-copy encode, cleared when the readback path takes over, freed
+    /// on Drop.
+    last_hw_frame: *mut ff::AVFrame,
 }
 
 // The raw libav pointers are owned solely by this struct and only touched from
@@ -166,6 +176,7 @@ impl VaapiH264Encoder {
                 fps: fps.clamp(1, 120),
                 last_reconfig: std::time::Instant::now(),
                 importer: None,
+                last_hw_frame: std::ptr::null_mut(),
             })
         }
     }
@@ -187,12 +198,37 @@ impl VaapiH264Encoder {
         if self.last_nv12.as_deref() != Some(nv12) {
             self.last_nv12 = Some(nv12.to_vec());
         }
+        // Readback is now the freshest source; drop any stale zero-copy frame so
+        // reencode_last doesn't prefer it.
+        if !self.last_hw_frame.is_null() {
+            unsafe { ff::av_frame_free(&mut self.last_hw_frame) };
+        }
         self.encode_nv12_inner(nv12, pts_us, is_idr)
     }
 
     /// Re-encode the last frame to hold the wire cadence when no new content
     /// arrived this tick (a tiny P-frame for static content).
     pub fn reencode_last(&mut self, pts_us: i64, is_idr: bool) -> Option<EncodedNal> {
+        // Zero-copy path: re-emit the cached GPU frame (the readback `last_nv12`
+        // is empty while zero-copy runs). Clone refs the same surface; the local
+        // ref is freed by the guard after send.
+        if !self.last_hw_frame.is_null() {
+            unsafe {
+                let f = ff::av_frame_clone(self.last_hw_frame);
+                if f.is_null() {
+                    return None;
+                }
+                let _g = FrameGuard(f);
+                (*f).pts = pts_us;
+                (*f).pict_type = if is_idr {
+                    ff::AVPictureType::AV_PICTURE_TYPE_I
+                } else {
+                    ff::AVPictureType::AV_PICTURE_TYPE_NONE
+                };
+                return self.send_and_drain(f);
+            }
+        }
+        // Readback path: re-emit the cached CPU NV12.
         let last = self.last_nv12.take()?;
         let out = self.encode_nv12_inner(&last, pts_us, is_idr);
         self.last_nv12 = Some(last);
@@ -229,15 +265,26 @@ impl VaapiH264Encoder {
         if width != self.width || height != self.height {
             return None;
         }
-        // Zero-copy VA-API import currently lacks a producer-sync barrier for
-        // explicit-sync compositors (KWin via wp_linux_drm_syncobj): the
-        // libavfilter import reads the teed dmabuf after KWin may have recycled
-        // it, yielding mostly-black frames. Vulkan avoids this with a
-        // QUEUE_FAMILY_FOREIGN_EXT barrier; we have no equivalent yet. So the
-        // zero-copy path is OPT-IN (WAYMUX_VAAPI_ZEROCOPY=1) until that's fixed;
-        // by default we disable it and the caller falls back to the EGL
-        // readback (task_to_nv12), which synchronizes correctly.
-        if self.importer.is_none() && std::env::var("WAYMUX_VAAPI_ZEROCOPY").as_deref() != Ok("1") {
+        // Zero-copy DRM_PRIME import is the DEFAULT, opt-out via
+        // WAYMUX_VAAPI_ZEROCOPY=0. Rationale: the CPU readback fallback
+        // (task_to_nv12 → destride_bgra) assumes a LINEAR row-major dmabuf, but
+        // RADV/AMD hands back a TILED buffer (DRM_FORMAT_MOD_INVALID, stride
+        // padded to a power-of-2 tile pitch — e.g. 8192 for a 1920-wide XRGB
+        // surface) for many sizes, notably 1080p. De-striding tiled bytes as
+        // linear shears the image into torn horizontal bands AND crawls (~1.5
+        // fps) because the mmap reads tiled/uncached GPU memory on the CPU. The
+        // zero-copy import maps the dmabuf onto VA-API honoring its modifier, so
+        // tiling is handled correctly on the GPU and there is no readback.
+        // Verified: 1080p went from torn ~2.5 fps (CPU readback) to clean ~50
+        // fps (zero-copy) on an RX 570; 720p (which happens to be LINEAR) stays
+        // clean. The import is gated at the call site by dmabuf_fence_ready_now,
+        // which covers implicit-sync producers (the common case). CAVEAT:
+        // explicit-sync producers (KWin via wp_linux_drm_syncobj) expose no
+        // implicit fence, so the gate can pass before the write completes →
+        // occasional black/partial frames; such hosts can force the (linear-only
+        // correct) readback with WAYMUX_VAAPI_ZEROCOPY=0. A fully-correct
+        // explicit-sync + tiled path (EGL import → glReadPixels) is future work.
+        if self.importer.is_none() && std::env::var("WAYMUX_VAAPI_ZEROCOPY").as_deref() == Ok("0") {
             self.importer = Some(None);
         }
         // Lazily build the import+convert filter graph on first dmabuf.
@@ -280,6 +327,13 @@ impl VaapiH264Encoder {
             if is_idr {
                 (*nv12_vaapi).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
             }
+            // Cache this GPU frame for reencode_last (idle/sparse hold). The
+            // clone refs the same VA surface (cheap); the original is freed by
+            // `_g` after send. Without this an idle nested desktop streams black.
+            if !self.last_hw_frame.is_null() {
+                ff::av_frame_free(&mut self.last_hw_frame);
+            }
+            self.last_hw_frame = ff::av_frame_clone(nv12_vaapi);
             self.send_and_drain(nv12_vaapi)
         }
     }
@@ -498,6 +552,9 @@ unsafe fn build_h264_vaapi_ctx(
 impl Drop for VaapiH264Encoder {
     fn drop(&mut self) {
         unsafe {
+            if !self.last_hw_frame.is_null() {
+                ff::av_frame_free(&mut self.last_hw_frame);
+            }
             if !self.codec_ctx.is_null() {
                 ff::avcodec_free_context(&mut (self.codec_ctx as *mut _));
             }
