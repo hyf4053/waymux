@@ -262,15 +262,22 @@ async fn attach_returns_connectable_socket_advertising_waymux_attach_v1() {
     }
     let r: Ar = resp.decode_result().unwrap();
     let attach_path = PathBuf::from(&r.attach_socket_path);
-    assert!(
-        attach_path.exists(),
-        "attach socket does not exist: {:?}",
-        attach_path
-    );
+    // The session binds the attach socket on its own thread after the daemon
+    // has already replied, so poll for it instead of asserting immediately:
+    // on a loaded CI runner the reply raced ahead of the bind.
+    let bind_deadline = Instant::now() + Duration::from_secs(15);
+    while !attach_path.exists() {
+        assert!(
+            Instant::now() < bind_deadline,
+            "attach socket never appeared: {:?}",
+            attach_path
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Connect a real wayland-client and verify the global is advertised.
-    // Wait briefly for the server thread to finish bind+accept.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Wait for the server thread to finish bind+accept.
+    let deadline = Instant::now() + Duration::from_secs(15);
     let saw_global = loop {
         let saw = tokio::task::spawn_blocking({
             let p = attach_path.clone();

@@ -895,6 +895,8 @@ async fn wait_for_idle_busy_then_idle() {
     let client_sock = wayland_sock.clone();
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_thread = stop_flag.clone();
+    let commits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let commits_in_thread = commits.clone();
     let client_task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let stream = std::os::unix::net::UnixStream::connect(&client_sock)?;
         let conn = Connection::from_socket(stream)?;
@@ -915,6 +917,7 @@ async fn wait_for_idle_busy_then_idle() {
             surface.commit();
             let _ = queue.flush();
             let _ = queue.dispatch_pending(&mut state);
+            commits_in_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(20));
         }
         std::mem::forget(toplevel);
@@ -929,7 +932,8 @@ async fn wait_for_idle_busy_then_idle() {
     // Wait until we see a window_created for this session — proves the client
     // has reached get_toplevel, which means commits are being received by the
     // compositor (or about to be).
-    let window_deadline = Instant::now() + Duration::from_secs(3);
+    let window_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_window = false;
     while Instant::now() < window_deadline {
         match timeout(Duration::from_millis(200), async {
             loop {
@@ -945,17 +949,29 @@ async fn wait_for_idle_busy_then_idle() {
                     ev.body,
                     EventBody::WindowCreated { ref name, .. } if name == "busy"
                 ) {
+                    saw_window = true;
                     break;
                 }
             }
             Err(_) => continue,
         }
     }
-    // Allow a moment for the committing loop to actually tick.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(saw_window, "window_created for 'busy' never arrived");
+    // Wait until the committing loop has demonstrably ticked several times,
+    // instead of sleeping and hoping: on a loaded CI runner a fixed 100ms
+    // nap raced the busy thread and the idle check below saw a quiet gap.
+    let cadence_deadline = Instant::now() + Duration::from_secs(30);
+    while commits.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+        assert!(
+            Instant::now() < cadence_deadline,
+            "busy client never started committing"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
-    // While the client is committing, wait_for_idle(quiet_ms=300) should time
-    // out within timeout_ms=300.
+    // While the client is committing (every 20ms), wait_for_idle should time
+    // out: a 1s quiet gap needs the busy thread stalled 50 ticks, which even
+    // a heavily loaded CI runner does not do.
     #[derive(serde::Deserialize)]
     struct Idle {
         idle: bool,
@@ -963,8 +979,8 @@ async fn wait_for_idle_busy_then_idle() {
     let resp = c
         .request(RequestMethod::WaitForIdle {
             name: "busy".into(),
-            quiet_ms: 300,
-            timeout_ms: 300,
+            quiet_ms: 1_000,
+            timeout_ms: 1_000,
         })
         .await;
     let r: Idle = resp.decode_result().unwrap();
@@ -980,7 +996,7 @@ async fn wait_for_idle_busy_then_idle() {
         .request(RequestMethod::WaitForIdle {
             name: "busy".into(),
             quiet_ms: 100,
-            timeout_ms: 3_000,
+            timeout_ms: 10_000,
         })
         .await;
     let r: Idle = resp.decode_result().unwrap();
@@ -1307,12 +1323,14 @@ async fn inject_key_delivers_to_focused_client() {
 }
 
 #[tokio::test]
-async fn inject_key_latency_is_sub_10ms() {
+async fn inject_key_wakeup_beats_poll_cycle() {
     // Regression guard for the eventfd wakeup. Before that fix, inject_key
     // events sat in the wayland-server buffer until the compositor thread's
-    // next 100ms poll cycle. With the wakeup path, the client should
-    // observe the key event within the Linux scheduling floor (usually
-    // well under 1ms, but we allow 10ms to be kind to CI).
+    // next 100ms poll cycle. With the wakeup path, the client observes the
+    // key event within the Linux scheduling floor (usually well under 1ms).
+    // The assert allows 50ms: an order of magnitude above scheduler noise
+    // on a loaded shared CI runner, and still half the 100ms poll cycle the
+    // regression would reintroduce.
     let d = Daemon::spawn().await;
     let mut c = d.connect().await;
     c.hello().await;
@@ -1384,9 +1402,11 @@ async fn inject_key_latency_is_sub_10ms() {
         Ok(())
     });
 
-    // Wait for focus.
+    // Wait for focus. Generous window: session startup on a loaded shared
+    // CI runner has taken >3s of total silence; this wait is readiness, not
+    // the latency under test.
     let _ = loop {
-        let ev = c.next_event(Duration::from_secs(3)).await;
+        let ev = c.next_event(Duration::from_secs(30)).await;
         if let EventBody::WindowCreated {
             name, window_id, ..
         } = &ev.body
@@ -1414,8 +1434,11 @@ async fn inject_key_latency_is_sub_10ms() {
         .await;
     assert!(resp.ok);
 
-    // Wait until the client records the key; measure wall-clock.
-    let deadline = Instant::now() + Duration::from_millis(100);
+    // Wait until the client records the key; measure wall-clock. The receive
+    // window is deliberately much larger than the latency assert below: a
+    // regressed (poll-cycle) delivery should still be RECEIVED here and then
+    // fail the assert with the measured number, not die on a timeout.
+    let deadline = Instant::now() + Duration::from_secs(5);
     let observed_at = loop {
         if key_log.snapshot().iter().any(|e| {
             matches!(
@@ -1429,18 +1452,15 @@ async fn inject_key_latency_is_sub_10ms() {
             break Instant::now();
         }
         if Instant::now() >= deadline {
-            panic!(
-                "never received key within 100ms; log={:?}",
-                key_log.snapshot()
-            );
+            panic!("never received key within 5s; log={:?}", key_log.snapshot());
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     };
 
     let latency = observed_at - sent_at;
     assert!(
-        latency < Duration::from_millis(10),
-        "inject_key round-trip latency {:?} > 10ms (eventfd wakeup regressed?)",
+        latency < Duration::from_millis(50),
+        "inject_key round-trip latency {:?} >= 50ms (eventfd wakeup regressed to the 100ms poll cycle?)",
         latency,
     );
 
