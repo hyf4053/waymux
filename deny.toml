@@ -1,13 +1,23 @@
-# deny.toml: supply-chain gating for the public waymux workspace
+# deny.toml — supply-chain gating for waymux
 #
 # Run locally: cargo deny check
-# Public CI runs the same command on every push/PR.
+# CI runs the same command on every push/PR.
 
 [advisories]
+# Fail on any unwithdrawn RustSec advisory.
+# version = 2 schema (cargo-deny 0.14+).
 version = 2
 yanked = "deny"
 ignore = [
     # Add advisory IDs here only with a one-line WHY and a date.
+    # e.g. "RUSTSEC-2024-XXXX",  # tracked in #99, no upstream fix yet (2026-05-06)
+    # quick-xml DoS advisories (quadratic dup-attr check / unbounded ns alloc).
+    # Only reachable via wayland-scanner, a build-time proc-macro parsing the
+    # crate's own vendored Wayland protocol XML: no untrusted input, no runtime
+    # exposure. Patched only in quick-xml >= 0.41, which wayland-scanner 0.31
+    # cannot take; drop these once wayland-scanner bumps past 0.41 (2026-07-04).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -22,20 +32,31 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",  # webpki-roots ships the Mozilla CA root list under this; data-only, permissive
-    "WTFPL",  # ffmpeg-sys-next / ffmpeg-next Rust wrappers (used by waymux-session) carry a WTFPL component; permissive, no-restriction
+    "WTFPL",  # ffmpeg-next / ffmpeg-sys-next Rust wrappers are WTFPL; FSF-free, Apache-2.0-compatible
 ]
+# Removed allowances we don't currently need: Unicode-DFS-2016, MPL-2.0,
+# CC0-1.0. cargo-deny 0.18+ fails the licenses check on unmatched
+# allowances ("license-not-encountered" warnings escalate to errors).
+# Add back deliberately if a future dep brings one in — that's the
+# point: every allowed license should be a conscious decision.
 confidence-threshold = 0.9
 exceptions = [
+    # Crate-specific license exceptions go here with a WHY.
 ]
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "warn"  # start as warn; flip to deny once tree is clean
 wildcards = "deny"
+# Internal path-only workspace deps (e.g. waymux-protocol = { path = ... })
+# are treated as wildcards by cargo-deny. They're first-party crates in this
+# repo, not external pinning hazards, so allow them.
 allow-wildcard-paths = true
 highlight = "all"
 deny = [
+    # { name = "openssl", reason = "use rustls" },
 ]
 skip = [
+    # known multi-version cases that are too painful to dedupe immediately
 ]
 
 [sources]
