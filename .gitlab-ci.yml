@@ -111,6 +111,11 @@ test:
   <<: [*rust-deps, *code-changes]
   variables:
     LIBGL_ALWAYS_SOFTWARE: "1"
+    # Each daemon integration test spawns a full compositor process that
+    # runs a hot event loop. Parallel libtest threads on the 2-vCPU shared
+    # runner starve whichever session loses the scheduling lottery (observed:
+    # 30s+ with zero events, different victim tests each run). Serialize.
+    RUST_TEST_THREADS: "1"
   script:
     - cargo test --workspace --all-targets --no-fail-fast
 
