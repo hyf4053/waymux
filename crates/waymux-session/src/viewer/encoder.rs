@@ -275,8 +275,45 @@ fn task_to_nv12(task: RecordingTask, width: u32, height: u32) -> Option<(Vec<u8>
     }
 }
 
+/// True when this NAL unit begins a new access unit: any non-VCL NAL
+/// that follows slices, or a VCL slice whose `first_mb_in_slice` is zero.
+fn starts_access_unit(nalu: &[u8], is_vcl: bool) -> bool {
+    !is_vcl || first_mb_in_slice(nalu) == 0
+}
+
+/// Decode the Exp-Golomb `first_mb_in_slice` field from a VCL NAL unit.
+/// Returns 0 when the field cannot be read, which safely treats the slice
+/// as the start of an access unit.
+fn first_mb_in_slice(nalu: &[u8]) -> u32 {
+    let rbsp = nalu.get(1..).unwrap_or(&[]);
+    let bit_at = |pos: usize| -> Option<u32> {
+        let byte = *rbsp.get(pos / 8)?;
+        Some(((byte >> (7 - (pos % 8))) & 1) as u32)
+    };
+    let mut pos = 0usize;
+    let mut leading_zeros = 0usize;
+    loop {
+        match bit_at(pos) {
+            Some(0) => leading_zeros += 1,
+            Some(_) => break,
+            None => return 0,
+        }
+        if leading_zeros > 31 {
+            return 0;
+        }
+        pos += 1;
+    }
+    let mut value = 0u32;
+    for _ in 0..leading_zeros {
+        pos += 1;
+        value = (value << 1) | bit_at(pos).unwrap_or(0);
+    }
+    value.wrapping_add((1u32 << leading_zeros) - 1)
+}
+
 /// NVENC subprocess encoder. Spawns ffmpeg, pipes NV12 in, parses
-/// Annex-B NALUs from stdout. Writes one `Frame::Nalu` per NALU.
+/// Annex-B NALUs from stdout, and writes one `Frame::Nalu` per access
+/// unit (frame).
 ///
 /// **Not tested on this laptop** (AMD Renoir has no NVENC). The structural
 /// design is a near-clone of the existing `recording_thread` NVENC
@@ -565,11 +602,15 @@ fn run_nvenc_encoder(
                             if !nalu.is_empty() {
                                 let nal_type = nalu[0] & 0x1F;
                                 let is_vcl = (1..=5).contains(&nal_type);
-                                // Flush pending AU when transitioning out of
-                                // a VCL slice: the next NALU starts the next
-                                // frame (either a fresh header set or another
-                                // VCL slice).
-                                if au_has_vcl {
+                                // Flush pending AU only when this NALU starts
+                                // a new frame. Looking at "any NALU after a
+                                // VCL slice" would split a multi-slice frame
+                                // (x264 with sliced-threads emits 12 slices
+                                // per 1280x800 frame) into N samples; Pion
+                                // then advances the RTP timestamp per slice
+                                // and the browser decodes only the first
+                                // slice (green remainder).
+                                if au_has_vcl && starts_access_unit(nalu, is_vcl) {
                                     if let Some(f) = nal_dump.as_mut() {
                                         if nal_dumped < NAL_DUMP_CAP {
                                             let _ = f.write_all(&pending_au);
@@ -1812,6 +1853,24 @@ fn find_annex_b_one(buf: &[u8], from: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use waymux_protocol::RecordingCodec;
+
+    #[test]
+    fn first_mb_in_slice_decodes_exp_golomb() {
+        assert_eq!(first_mb_in_slice(&[0x65, 0x88]), 0);
+        assert_eq!(first_mb_in_slice(&[0x65, 0x40]), 1);
+        assert_eq!(first_mb_in_slice(&[0x65, 0x18]), 11);
+        assert_eq!(first_mb_in_slice(&[0x65]), 0);
+        assert_eq!(first_mb_in_slice(&[]), 0);
+    }
+
+    #[test]
+    fn access_unit_starts_only_at_first_slice_or_after_vcl() {
+        let first_slice = [0x41u8, 0x88];
+        let later_slice = [0x41u8, 0x40];
+        assert!(starts_access_unit(&first_slice, true));
+        assert!(!starts_access_unit(&later_slice, true));
+        assert!(starts_access_unit(&[0x06], false));
+    }
 
     #[test]
     fn adaptive_qp_tightens_over_budget_loosens_under() {
