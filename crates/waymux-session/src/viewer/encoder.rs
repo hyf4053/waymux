@@ -1224,6 +1224,12 @@ fn run_cuda_nvenc_encoder(
             return Some(socket);
         }
     };
+    // Dimensions the live NVENC session (and its persistent NV12 buffer) were
+    // opened for. Frames of any other size must not reach `encode_dmabuf`:
+    // it would either reject them or overrun the allocation. A session
+    // resize rebuilds the recorder instead (see the loop below).
+    let mut cur_w = w;
+    let mut cur_h = h;
 
     let writer = match socket.try_clone() {
         Ok(s) => Arc::new(Mutex::new(s)),
@@ -1236,6 +1242,10 @@ fn run_cuda_nvenc_encoder(
     let target_bitrate = Arc::new(AtomicU32::new(0));
     // Clone the cursor_channel Arc before moving `state` into the control reader.
     let cursor_channel = Arc::clone(&state.cursor_channel);
+    // Keep a handle to the session state for the resize watch below: a
+    // `Waymux resize` updates the logical output size, and the whole-desktop
+    // frames KWin commits afterwards change size to match.
+    let session_state = Arc::clone(&state);
     spawn_control_reader(
         socket,
         stop_flag.clone(),
@@ -1314,12 +1324,77 @@ fn run_cuda_nvenc_encoder(
             .checked_sub(ENCODE_BUDGET)
             .unwrap_or(next_tick)
             .saturating_duration_since(std::time::Instant::now());
-        let task = frame_slot.take_blocking(wait);
+        let mut task = frame_slot.take_blocking(wait);
 
         let pts_us = start.elapsed().as_micros() as i64;
-        // IDR only if a viewer PLI / ForceKeyframe arrived since the last one;
-        // otherwise a P-frame. Read (don't consume) — cleared only after a frame
-        // actually goes out, so a dropped/failed encode can't eat a pending PLI.
+
+        // -- Dynamic resolution ------------------------------------------------
+        // `Waymux resize` updates the session's logical output, after which
+        // KWin commits whole-desktop buffers at the new size. The persistent
+        // NV12 buffer and NVENC session are fixed at the size they were opened
+        // for, so rebuild the recorder when such a frame arrives. Only frames
+        // matching the session's current output may trigger a rebuild:
+        // cursor/popup/subsurface commits have arbitrary sizes and stale
+        // buffers linger during the transition. Everything mismatched is
+        // dropped and the constant-cadence loop holds the last good frame.
+        if let Some((fw, fh)) = match &task {
+            Some(RecordingTask::Dmabuf { dma, .. }) => {
+                Some((dma.width as u32, dma.height as u32))
+            }
+            Some(RecordingTask::Pixels {
+                width, height, ..
+            }) => Some((*width, *height)),
+            _ => None,
+        } {
+            if fw < MIN_DIM || fh < MIN_DIM {
+                // Degenerate cursor/solid commit, not a desktop frame.
+                task = None;
+            } else if (fw, fh) != (cur_w, cur_h) {
+                let (out_w, out_h, _) = session_state.snapshot();
+                if fw == out_w && fh == out_h {
+                    // Open the replacement before dropping the old recorder so
+                    // a failed open leaves a working encoder at the previous
+                    // size (new-size frames are then skipped until a later
+                    // attempt succeeds). Two NVENC sessions may briefly coexist;
+                    // every supported driver allows at least two.
+                    match CudaNvencRecorder::try_new(fw, fh) {
+                        Some(new_recorder) => {
+                            info!(
+                                old_width = cur_w,
+                                old_height = cur_h,
+                                width = fw,
+                                height = fh,
+                                "viewer cuda-nvenc: resolution change; rebuilding encoder"
+                            );
+                            recorder = new_recorder;
+                            cur_w = fw;
+                            cur_h = fh;
+                            // Fresh encoder has no reference frame: force an
+                            // IDR (with the new SPS/PPS) even if this frame's
+                            // encode fails and a later tick has to re-encode.
+                            force_idr.store(true, Ordering::Release);
+                        }
+                        None => {
+                            warn!(
+                                width = fw,
+                                height = fh,
+                                "viewer cuda-nvenc: rebuild for resolution change failed; holding last frame"
+                            );
+                            task = None;
+                        }
+                    }
+                } else {
+                    // Not the desktop output (cursor, popup, or a stale
+                    // old-size buffer mid-resize).
+                    task = None;
+                }
+            }
+        }
+
+        // IDR only if a viewer PLI / ForceKeyframe (or a resolution rebuild)
+        // arrived since the last one; otherwise a P-frame. Read (don't consume)
+        // — cleared only after a frame actually goes out, so a dropped/failed
+        // encode can't eat a pending PLI.
         let idr = force_idr.load(Ordering::Acquire);
 
         // Apply a pending GCC bitrate target (0 = no change requested).
