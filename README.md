@@ -3,11 +3,14 @@
 **Headless Wayland sessions you can spawn, screenshot, record, script, and watch
 live in a browser, driven by a CLI and an MCP server.**
 
-[![pipeline status](https://gitlab.com/tek.cat/waymux/badges/main/pipeline.svg)](https://gitlab.com/tek.cat/waymux/-/pipelines)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![MSRV: Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](./rust-toolchain.toml)
 
-Project home: [gitlab.com/tek.cat/waymux](https://gitlab.com/tek.cat/waymux).
+> **Maintained fork.** This repository is a fork of the archived
+> [waymux/waymux](https://github.com/waymux/waymux), maintained for Life Harbor's
+> local GUI integration. The original project home is
+> [gitlab.com/tek.cat/waymux](https://gitlab.com/tek.cat/waymux); upstream no
+> longer receives changes, so fixes are carried here.
 
 Multiplex Wayland clients (and nested compositors like KWin / Plasma 6) as
 named, headless, detachable sessions: spawn an app or a whole desktop into a
@@ -47,6 +50,21 @@ License: Apache-2.0. Status: early public release (`0.2.0-dev`). See
   Wayland"), a GitHub Action (`waymux/waymux@v1`), and a GitLab CI `include`
   template make it a drop-in. See
   [docs/headless-ci-testing.md](docs/headless-ci-testing.md).
+
+## Maintained fork changes
+
+Fixes carried on top of the last upstream commit:
+
+- Request an IDR as soon as a browser viewer attaches, so the first frames
+  decode without waiting for the browser's PLI round-trip.
+- Treat an explicit-sync acquire result as authoritative and gate every
+  in-process GPU encoder on desktop-output size and producer completion. This
+  removes the green/half-composited frames seen with a nested KWin.
+- Re-tap a skipped whole-desktop commit after 150 ms while the same buffer is
+  still current. Previously a skipped final commit left the viewer frozen on a
+  pre-resize frame once the application went idle.
+
+Dependencies are pinned by the committed `Cargo.lock`.
 
 ## Try it
 
