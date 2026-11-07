@@ -853,7 +853,14 @@ impl Dispatch<WlSurface, SurfaceData> for Compositor {
                     .unwrap()
                     .as_ref()
                     .map(|s| s.take_pending());
-                let mut acquire_signaled = true;
+                // `None` = this commit carries no explicit-sync acquire point
+                // (readiness falls back to the implicit dmabuf fence).
+                // `Some(ready)` = explicit sync was used for this commit; its
+                // result is AUTHORITATIVE. Explicit-sync dmabufs usually have
+                // no implicit fence, which the implicit probe reports as
+                // "ready" — ORing the two would hide a timed-out acquire and
+                // forward a buffer the producer is still writing.
+                let mut explicit_acquire: Option<bool> = None;
                 if let Some((Some(p), _)) = pending_sync.as_ref() {
                     // Live-UX deadline: 50 ms. When recording is active
                     // we extend the deadline because the alternative is
@@ -874,8 +881,8 @@ impl Dispatch<WlSurface, SurfaceData> for Compositor {
                             timeout_ms = timeout_ns / 1_000_000,
                             "syncobj: acquire-point wait timed out, forwarding anyway"
                         );
-                        acquire_signaled = false;
                     }
+                    explicit_acquire = Some(waited);
                 }
 
                 // Promote pending → current. Release the PREVIOUS current
@@ -986,7 +993,7 @@ impl Dispatch<WlSurface, SurfaceData> for Compositor {
                 }
                 state
                     .state
-                    .maybe_tap_for_recording(surface_resource, acquire_signaled);
+                    .maybe_tap_for_recording(surface_resource, explicit_acquire);
                 // Now safe to fire the deferred wl_buffer.release for cur:
                 // the recording tap has already done its mmap+memcpy
                 // against the just-attached buffer.

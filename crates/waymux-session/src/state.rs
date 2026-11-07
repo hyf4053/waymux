@@ -213,6 +213,9 @@ pub struct State {
     /// the current `Instant::now()`. None until the first whole-desktop
     /// frame is captured.
     pub(crate) last_whole_desktop_capture: Mutex<Option<std::time::Instant>>,
+    /// Generation counter for the debounced retry of a skipped whole-desktop
+    /// commit. See `schedule_whole_desktop_retry`.
+    pub(crate) whole_desktop_retry: AtomicU64,
 
     // ── browser WebRTC viewer (neko-bridge) ───────────────────────────────
     /// Active viewer handle. At most one viewer per session (v1).
@@ -302,6 +305,7 @@ impl State {
             buffer_hold_state: Mutex::new(HashMap::new()),
             recording: Mutex::new(None),
             last_whole_desktop_capture: Mutex::new(None),
+            whole_desktop_retry: AtomicU64::new(0),
             viewer: Mutex::new(None),
             cursor_surface: Mutex::new(None),
             cursor_channel: std::sync::Arc::new(Default::default()),
@@ -1278,7 +1282,20 @@ impl State {
     /// the whole desktop, but the parameter exists to support
     /// `FocusedWindow` filtering without a second focused-window
     /// lookup.
-    pub fn maybe_tap_for_recording(self: &Arc<Self>, surface: &WlSurface, acquire_signaled: bool) {
+    pub fn maybe_tap_for_recording(
+        self: &Arc<Self>,
+        surface: &WlSurface,
+        explicit_acquire: Option<bool>,
+    ) {
+        self.tap_for_recording(surface, explicit_acquire, false);
+    }
+
+    fn tap_for_recording(
+        self: &Arc<Self>,
+        surface: &WlSurface,
+        explicit_acquire: Option<bool>,
+        is_retry: bool,
+    ) {
         // Snapshot per-encoder (mode, slot, codec) tuples so we can drop the
         // recording mutex before doing any I/O. Both encoders share the same
         // capture `mode` today (set at record start), but each owns its slot
@@ -1379,9 +1396,15 @@ impl State {
                 // which silently drops every commit (seen on Blackwell
                 // + driver 580.95.05 hosts with `syncobj: opened DRM
                 // node` in the daemon log).
-                if !all_gpu_path && !acquire_signaled && !self.dmabuf_implicit_fence_ready(surface)
-                {
-                    return;
+                if !all_gpu_path {
+                    // Explicit-sync readiness is authoritative when this
+                    // commit carried an acquire point; otherwise fall back to
+                    // the implicit dmabuf fence (or CPU-coherent memory).
+                    let writes_done = explicit_acquire
+                        .unwrap_or_else(|| self.dmabuf_implicit_fence_ready(surface));
+                    if !writes_done {
+                        return;
+                    }
                 }
                 // Tee the buffer (cheap: clone the Arc, pin via
                 // InnerBufferHold) and let the recording thread do the
@@ -1458,29 +1481,33 @@ impl State {
                 // icons, subsurfaces) are valid ARGB dmabufs but the WRONG
                 // size/tiling — teeing them as a 1080p frame is the pink flash
                 // + partial-content flicker. See committed_buffer_is_desktop_output.
-                let committed_is_dmabuf = self.committed_buffer_is_desktop_output(surface);
+                let committed_is_desktop_output = self.committed_buffer_is_desktop_output(surface);
+                let committed_any_dmabuf = self.committed_buffer_is_dmabuf(surface);
                 // Are KWin's GPU writes for THIS commit actually complete?
                 // KWin uses explicit sync (wp_linux_drm_syncobj_v1) on these
-                // hosts; the commit handler waits the acquire fence with a 50ms
-                // deadline and sets `acquire_signaled=false` when it times out
-                // (heavy bursts: menu close, video). The implicit dmabuf fence
-                // is the fallback for hosts NOT using explicit sync. If NEITHER
-                // signal says "done", the buffer is still mid-composite — teeing
-                // it encodes a half-rendered frame (the desktop wallpaper showing
-                // through where windows/panel aren't painted yet = the blue/
-                // "reveals underneath" flicker). Skip it; the constant-cadence
-                // encoder holds the last good frame (~16ms, invisible). Either
-                // signal alone is enough (chromium/KWin signal one or the other
-                // depending on the swap path).
-                let gpu_writes_done = acquire_signaled || self.dmabuf_implicit_fence_ready(surface);
-                if committed_is_dmabuf && !gpu_writes_done {
+                // hosts; the commit handler waits the acquire point with a 50ms
+                // deadline. For explicit-sync commits that result is
+                // authoritative — the implicit fence probe is NOT a fallback
+                // there (explicit-sync dmabufs usually have no implicit fence,
+                // which the probe reports as ready, masking a timeout). For
+                // commits without an explicit acquire point, fall back to the
+                // implicit dmabuf fence (or CPU-coherent memory). If the buffer
+                // is still mid-composite, teeing it encodes a half-rendered
+                // frame (green flash / wallpaper showing through). Skip it; the
+                // constant-cadence encoder holds the last good frame (~16ms,
+                // invisible).
+                let gpu_writes_done = match explicit_acquire {
+                    Some(ready) => ready,
+                    None => self.dmabuf_implicit_fence_ready(surface),
+                };
+                if committed_is_desktop_output && !gpu_writes_done {
                     static SKIP_LOG: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
                     let s = SKIP_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if s < 12 || s.is_multiple_of(60) {
                         tracing::info!(
                             skip_n = s,
-                            acquire_signaled,
+                            explicit_acquire,
                             "WholeDesktop tee: SKIP incomplete (mid-composite) desktop buffer"
                         );
                     }
@@ -1520,7 +1547,7 @@ impl State {
                                         stride = d.stride,
                                         modifier = format!("0x{:x}", d.modifier),
                                         drm_format = format!("0x{:x}", d.drm_format),
-                                        gated_ok = committed_is_dmabuf,
+                                        gated_ok = committed_is_desktop_output,
                                         "WHOLEDESKTOP-DIAG: committed dmabuf surface"
                                     );
                                 }
@@ -1560,46 +1587,48 @@ impl State {
                         // recordings of animating content frozen for many seconds.
                         // Teeing off-thread keeps the compositor responsive.
                         //
-                        // Wrong-size commits (the cursor, popups) are dropped by
-                        // the recorder's frame-size check; the recorder sizes to
-                        // the desktop output because prime_recording_first_frame
-                        // seeds it from the output-sized surface first.
+                        // Gate EVERY in-process GPU encoder (NVENC, Vulkan,
+                        // VA-API) on the same two conditions:
                         //
-                        // The in-process VA-API encoder is FIXED to the desktop
-                        // output size and has NO producer-sync barrier (unlike the
-                        // Vulkan/NVENC encoders, which insert a QUEUE_FAMILY_FOREIGN_EXT
-                        // barrier on import and so tee unconditionally below). So for
-                        // VA-API we tee ONLY the desktop-output surface, and only when
-                        // the producer's writes are complete. This prevents the two
-                        // failures both seen with KWin (which uses explicit sync AND
-                        // commits a separate 24x24 hardware-cursor surface that a
-                        // single-surface client like a bare Vulkan app never does):
+                        //  1. The committed dmabuf must be the desktop output
+                        //     (ARGB/XRGB, output-sized). The WholeDesktop tap
+                        //     fires on EVERY commit, including the 24x24 cursor,
+                        //     popups and transition overlays. Teeing one of those
+                        //     into the latest-only slot replaces the real desktop
+                        //     frame with a wrong-size buffer; the encoder either
+                        //     encodes partial content (green/garbage flash) or
+                        //     drops it and holds -> stutter/black viewer.
+                        //  2. The producer's GPU writes must be complete
+                        //     (`gpu_writes_done`). KWin uses explicit sync
+                        //     (wp_linux_drm_syncobj_v1) and its acquire-point
+                        //     wait times out under load; the implicit-fence probe
+                        //     is meaningless for explicit-sync buffers. Teeing a
+                        //     mid-composite buffer encodes a half-rendered frame
+                        //     (green flash / wallpaper showing through). The
+                        //     constant-cadence encoder holds the last good frame
+                        //     for the skipped commit (~16 ms, invisible).
                         //
-                        //  1. Wrong-surface clobber: the WholeDesktop tap fires on
-                        //     EVERY commit, including the cursor / popups / subsurfaces
-                        //     (committed_is_dmabuf == false: not a desktop-output-sized
-                        //     dmabuf). Teeing those into the latest-only frame slot
-                        //     overwrites the real desktop frame with a 24x24 buffer the
-                        //     encoder then size-rejects and holds -> real frames rarely
-                        //     survive -> black viewer. (This is the actual mechanism
-                        //     behind the old "zero-copy gives black frames on KWin".)
-                        //  2. Producer not done: an explicit-sync producer (KWin via
-                        //     wp_linux_drm_syncobj) whose acquire fence has not signaled
-                        //     (gpu_writes_done == false) would be teed half-rendered ->
-                        //     torn/black. The acquire fence is waited at commit time;
-                        //     gpu_writes_done is true when it signaled OR the implicit
-                        //     dmabuf fence is ready.
+                        // CPU-backed commits (SHM/SinglePixel) fall through:
+                        // push_focused handles them synchronously and the viewer
+                        // encoder drops sub-MIN_DIM idle buffers cheaply.
                         //
-                        // The InnerBufferHold (created in push_focused) pins the buffer
-                        // against recycle until the encoder finishes, and the viewer
-                        // encoder additionally gates on the implicit dmabuf fence for
-                        // implicit-sync clients. Together this makes the VA-API
-                        // zero-copy path correct for explicit- and implicit-sync,
-                        // linear and tiled, single- and multi-surface producers.
-                        // Skipped frames are held by the viewer's min-fps tick.
-                        let vaapi_gate =
-                            matches!(codec, waymux_protocol::RecordingCodec::H264Vaapi);
-                        if vaapi_gate && (!committed_is_dmabuf || !gpu_writes_done) {
+                        // The InnerBufferHold (created in push_focused) pins the
+                        // buffer against recycle until the encoder finishes.
+                        if committed_any_dmabuf
+                            && (!committed_is_desktop_output || !gpu_writes_done)
+                        {
+                            // A skipped final commit would leave the viewer on
+                            // the previous (often mid-resize) frame forever
+                            // once the app goes idle. Reconsider this buffer
+                            // shortly. Never reschedule from a retry itself.
+                            if committed_is_desktop_output && !is_retry {
+                                self.schedule_whole_desktop_retry(surface);
+                            } else if is_retry {
+                                tracing::info!(
+                                    explicit_acquire,
+                                    "WholeDesktop tee: retry still incomplete"
+                                );
+                            }
                             continue;
                         }
                         self.push_focused_buffer_to_recording(surface, slot, *codec);
@@ -1653,6 +1682,59 @@ impl State {
         }
     }
 
+    /// Reconsider a skipped whole-desktop commit once its buffer had time to
+    /// settle.
+    ///
+    /// A skip means the producer's GPU writes were not complete when the
+    /// frame was due. If the application then goes idle, no further commit
+    /// replaces it and the viewer stays on the previous (often mid-resize)
+    /// frame indefinitely. Retry the tap after a short delay, but only while
+    /// that same buffer is still the surface's current one: an animating
+    /// client will have committed a newer buffer by then, and its own commits
+    /// drive the tap as usual.
+    fn schedule_whole_desktop_retry(self: &Arc<Self>, surface: &WlSurface) {
+        use crate::compositor::SurfaceData;
+        let Some(sd) = surface.data::<SurfaceData>() else {
+            return;
+        };
+        let Some(buffer) = sd.current_buffer.lock().unwrap().clone() else {
+            return;
+        };
+        let generation = self
+            .whole_desktop_retry
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let state = Arc::clone(self);
+        let surface = surface.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if state.whole_desktop_retry.load(Ordering::Acquire) != generation {
+                tracing::debug!(generation, "whole-desktop retry: superseded");
+                return;
+            }
+            let Some(sd) = surface.data::<SurfaceData>() else {
+                tracing::debug!("whole-desktop retry: surface data gone");
+                return;
+            };
+            let current_id = sd
+                .current_buffer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|current| current.id());
+            if current_id != Some(buffer.id()) {
+                tracing::debug!(
+                    ?current_id,
+                    expected = ?buffer.id(),
+                    "whole-desktop retry: buffer no longer current"
+                );
+                return;
+            }
+            tracing::info!("whole-desktop retry: re-tapping");
+            state.tap_for_recording(&surface, None, true);
+        });
+    }
+
     /// Seed the active recording slots with the current desktop buffer so a
     /// recording started over an IDLE (static) desktop produces output
     /// immediately, instead of blocking up to 30s for the next `wl_surface`
@@ -1690,10 +1772,10 @@ impl State {
         // Drive one tap as if `seed` had just committed. The tap owns the full
         // routing logic: a zero-copy `Dmabuf` tee when the output is a real
         // dmabuf, or a `capture_desktop()` → `Pixels` readback when an idle
-        // desktop is presenting a `wp_single_pixel_buffer`. `acquire_signaled`
-        // is true: `seed`'s buffer is already presented, so its producer fence
-        // is long settled. A no-op when nothing is recording.
-        self.maybe_tap_for_recording(seed, true);
+        // desktop is presenting a `wp_single_pixel_buffer`. `None` means "no
+        // explicit-sync acquire point": `seed`'s buffer is already presented,
+        // so readiness falls back to the implicit fence (settled).
+        self.maybe_tap_for_recording(seed, None);
     }
 
     /// True iff the surface's committed buffer is an ARGB/XRGB dmabuf whose
@@ -1735,6 +1817,23 @@ impl State {
             }
             _ => false,
         }
+    }
+
+    /// Whether the just-committed buffer is a dmabuf at all (regardless of
+    /// size/format). Used to distinguish a wrong-surface GPU commit (cursor,
+    /// popup, transition overlay — must be skipped before it can clobber the
+    /// latest-wins viewer slot) from a CPU-backed commit (SHM/SinglePixel,
+    /// which the encoders either consume as Pixels or drop cheaply).
+    fn committed_buffer_is_dmabuf(&self, surface: &WlSurface) -> bool {
+        use crate::buffer::BufferKind;
+        use crate::compositor::SurfaceData;
+        let Some(sd) = surface.data::<SurfaceData>() else {
+            return false;
+        };
+        let Some(buf) = sd.current_buffer.lock().unwrap().clone() else {
+            return false;
+        };
+        matches!(buf.data::<BufferKind>(), Some(BufferKind::Dmabuf(_)))
     }
 
     /// Tee the focused window's just-committed dmabuf to the recording
