@@ -1890,10 +1890,15 @@ pub struct CudaNvencRecorder {
 /// any frame whose dimensions exceed the allocation rather than clamping: a
 /// genuinely wrong-sized frame produces garbage output anyway, and rejecting is
 /// the simplest guarantee that no kernel launch can ever write past the fixed
-/// NV12 buffer. Boundary-equal dimensions (`== max`) are allowed. A request of
-/// `stride == 0` is treated as "unspecified" and accepted (the dmabuf path's
-/// stride is the source row pitch, not a destination bound; the destination
-/// pitch is always `nv12_pitch`).
+/// NV12 buffer. Boundary-equal dimensions (`== max`) are allowed.
+///
+/// `req_stride` is the SOURCE row pitch in BYTES (ARGB8888 = 4 bytes/pixel). It
+/// only feeds the EGLImage import; the CSC kernel never receives it, and the
+/// destination writes are bounded by `width`/`height` plus the fixed
+/// `nv12_pitch`. Comparing it against `nv12_pitch` directly is a unit mismatch
+/// (5760 source bytes vs 1536 destination pixels) that rejected every dmabuf
+/// frame. A non-zero stride too small to hold one source row is malformed;
+/// `stride == 0` means "unspecified" (the host-pixels chokepoint passes 0).
 ///
 /// Mirrors the existing host-pixels clamp in `encode_pixels`, but as a reject so
 /// it can sit at the kernel-launch chokepoint that both paths funnel through.
@@ -1903,16 +1908,11 @@ fn safe_encode_dims(
     req_stride: u32,
     max_w: u32,
     max_h: u32,
-    max_pitch: u32,
 ) -> Option<(u32, u32, u32)> {
     if req_w > max_w || req_h > max_h {
         return None;
     }
-    // stride == 0 means the caller did not specify a meaningful source pitch;
-    // the destination pitch is always the fixed nv12_pitch, so it cannot drive
-    // an OOB write on its own. A positive stride larger than the destination
-    // pitch indicates a malformed/oversized buffer → reject.
-    if req_stride != 0 && req_stride > max_pitch {
+    if req_stride != 0 && req_stride < req_w.saturating_mul(4) {
         return None;
     }
     Some((req_w, req_h, req_stride))
@@ -2053,25 +2053,15 @@ impl CudaNvencRecorder {
         // write out of bounds in the shared per-session encoder context. Reject
         // such a frame up front (before doing any EGL/CUDA import work) and log
         // at most once.
-        if safe_encode_dims(
-            width,
-            height,
-            stride,
-            self.width,
-            self.height,
-            self.nv12_pitch,
-        )
-        .is_none()
-        {
+        if safe_encode_dims(width, height, stride, self.width, self.height).is_none() {
             if !self.oversize_rejected_logged {
                 self.oversize_rejected_logged = true;
                 tracing::warn!(
-                    "cuda_nvenc: rejecting oversized dmabuf frame {width}x{height} stride={stride} \
-                     (encoder allocated for {}x{} pitch={}); dropping frame to avoid OOB device write \
+                    "cuda_nvenc: rejecting malformed/oversized dmabuf frame {width}x{height} \
+                     stride={stride} (encoder allocated for {}x{}); dropping frame \
                      (further such rejections suppressed)",
                     self.width,
-                    self.height,
-                    self.nv12_pitch
+                    self.height
                 );
             }
             return None;
@@ -2219,7 +2209,7 @@ impl CudaNvencRecorder {
         // past `nv12_devptr`, independent of caller discipline. `encode_dmabuf`
         // already rejected oversized frames up front; this is the defense in
         // depth that makes the kernel launch below unconditionally safe.
-        if safe_encode_dims(width, height, 0, self.width, self.height, self.nv12_pitch).is_none() {
+        if safe_encode_dims(width, height, 0, self.width, self.height).is_none() {
             if !self.oversize_rejected_logged {
                 self.oversize_rejected_logged = true;
                 tracing::warn!(
@@ -2799,26 +2789,47 @@ mod tests {
     // boundary-equal frames through unchanged.
     #[test]
     fn safe_encode_dims_passes_in_bounds() {
-        // Strictly under all limits → accepted, returned verbatim.
+        // Strictly under the dimension limits → accepted, returned verbatim.
         assert_eq!(
-            super::safe_encode_dims(1280, 720, 5120, 1920, 1080, 7680),
+            super::safe_encode_dims(1280, 720, 5120, 1920, 1080),
             Some((1280, 720, 5120))
         );
     }
 
     #[test]
     fn safe_encode_dims_allows_exact_boundary() {
-        // width == max_w, height == max_h, stride == max_pitch → still allowed.
+        // width == max_w, height == max_h → still allowed.
         assert_eq!(
-            super::safe_encode_dims(1920, 1080, 7680, 1920, 1080, 7680),
+            super::safe_encode_dims(1920, 1080, 7680, 1920, 1080),
             Some((1920, 1080, 7680))
+        );
+    }
+
+    #[test]
+    fn safe_encode_dims_accepts_dmabuf_byte_stride_at_max_width() {
+        // Regression: a 1440x900 dmabuf reports stride 5760 (1440 × 4 BYTES),
+        // while the NV12 destination pitch is 1536 PIXELS. These are different
+        // units; comparing them rejected every dmabuf frame and blacked out
+        // Krita/Blender. The source stride must pass when rows are large enough.
+        assert_eq!(
+            super::safe_encode_dims(1440, 900, 5760, 1440, 900),
+            Some((1440, 900, 5760))
+        );
+    }
+
+    #[test]
+    fn safe_encode_dims_accepts_padded_source_stride() {
+        // GPU pitch padding may exceed a tightly-packed source row; still valid.
+        assert_eq!(
+            super::safe_encode_dims(1440, 900, 5888, 1440, 900),
+            Some((1440, 900, 5888))
         );
     }
 
     #[test]
     fn safe_encode_dims_rejects_over_width() {
         assert_eq!(
-            super::safe_encode_dims(1921, 1080, 7680, 1920, 1080, 7680),
+            super::safe_encode_dims(1921, 1080, 7684, 1920, 1080),
             None
         );
     }
@@ -2826,17 +2837,17 @@ mod tests {
     #[test]
     fn safe_encode_dims_rejects_over_height() {
         assert_eq!(
-            super::safe_encode_dims(1920, 1081, 7680, 1920, 1080, 7680),
+            super::safe_encode_dims(1920, 1081, 7680, 1920, 1080),
             None
         );
     }
 
     #[test]
-    fn safe_encode_dims_rejects_over_stride() {
-        // In-bounds w/h but a stride larger than the destination pitch is the
-        // classic "malformed buffer" OOB driver → reject.
+    fn safe_encode_dims_rejects_undersized_source_stride() {
+        // A non-zero source stride that cannot hold one ARGB8888 row is
+        // malformed → reject before the EGL import.
         assert_eq!(
-            super::safe_encode_dims(1920, 1080, 7681, 1920, 1080, 7680),
+            super::safe_encode_dims(1920, 1080, 7679, 1920, 1080),
             None
         );
     }
@@ -2847,7 +2858,7 @@ mod tests {
         // destination pitch is always nv12_pitch); 0 must not be treated as an
         // overflow.
         assert_eq!(
-            super::safe_encode_dims(1920, 1080, 0, 1920, 1080, 7680),
+            super::safe_encode_dims(1920, 1080, 0, 1920, 1080),
             Some((1920, 1080, 0))
         );
     }
@@ -2856,7 +2867,7 @@ mod tests {
     fn safe_encode_dims_rejects_grossly_oversized_attack() {
         // A hostile client claiming a huge dmabuf to overflow the device heap.
         assert_eq!(
-            super::safe_encode_dims(65535, 65535, 262140, 1920, 1080, 7680),
+            super::safe_encode_dims(65535, 65535, 262140, 1920, 1080),
             None
         );
     }
