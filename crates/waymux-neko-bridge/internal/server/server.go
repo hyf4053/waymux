@@ -1230,6 +1230,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A viewer that just attached has no reference frames, and the encoder's
+	// GOP is effectively infinite (IDRs only on PLI/heartbeat). Ask for an
+	// on-demand IDR right away so the first frames decode instead of leaving
+	// the <video> black/green until the browser's PLI round-trip completes.
+	// Non-fatal: a failed write just falls back to the PLI path below.
+	if s.cfg.SocketW != nil {
+		s.sockMu.Lock()
+		kfErr := sock.WriteFrame(s.cfg.SocketW, sock.Frame{Tag: sock.TagForceKeyframe})
+		s.sockMu.Unlock()
+		if kfErr != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Warn("force-keyframe write failed on viewer attach", "err", kfErr)
+		}
+	}
+
 	// T3: forward browser RTCP PLI/FIR to the session encoder as an
 	// on-demand force-keyframe. Without this, a viewer that joins or
 	// recovers mid-motion gets no IDR until the session's idle
